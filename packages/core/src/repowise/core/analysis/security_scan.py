@@ -22,12 +22,67 @@ import ast
 import logging
 import re
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.test_paths import is_test_related_path
+
 logger = logging.getLogger(__name__)
+
+_CREDENTIAL_EXACT_PLACEHOLDERS: frozenset[str] = frozenset({"password", "changeit"})
+
+_CREDENTIAL_SUBSTRING_PLACEHOLDERS: tuple[str, ...] = (
+    "example",
+    "changeme",
+    "placeholder",
+    "dummy",
+    "sample",
+    "fake",
+    "xxx",
+    "your_",
+    "your-",
+    "...",
+    "fixture",
+)
+
+_LOW_SEVERITY_PATH_TOKENS: frozenset[str] = frozenset(
+    {
+        "test",
+        "tests",
+        "__tests__",
+        "__test__",
+        "fixtures",
+        "__fixtures__",
+        "spec",
+        "specs",
+        "mock",
+        "mocks",
+        "__mocks__",
+        "example",
+        "examples",
+    }
+)
+
+
+def _is_valid_credential_value(val: str) -> bool:
+    """True when *val* is at least 8 chars and not a known placeholder."""
+    if len(val) < 8:
+        return False
+    v = val.lower().strip()
+    if v.startswith("<") or v in _CREDENTIAL_EXACT_PLACEHOLDERS:
+        return False
+    return not any(p in v for p in _CREDENTIAL_SUBSTRING_PLACEHOLDERS)
+
+
+def _is_low_severity_path(file_path: str) -> bool:
+    """True when *file_path* is test material or under fixture, spec, mock, or example directories."""
+    posix_path = file_path.replace("\\", "/")
+    parts = [p.lower() for p in PurePosixPath(posix_path).parts]
+    return any(p in _LOW_SEVERITY_PATH_TOKENS for p in parts) or is_test_related_path(posix_path)
+
 
 # ---------------------------------------------------------------------------
 # Pattern registry: (compiled_pattern, kind_label, severity)
@@ -78,12 +133,58 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # concatenating these patterns' *source text*, which drops per-pattern
     # flags. A flag here would leave the prefilter case-sensitive and it would
     # reject the line before the pattern ever ran.
-    (re.compile(r"(?i:password)\s*=\s*['\"]"), "hardcoded_password", "high"),
-    (re.compile(r"(?i:api_?key|secret)\s*=\s*['\"]"), "hardcoded_secret", "high"),
+    (re.compile(r"(?i:password)\s*=\s*['\"]([^'\"]*)"), "hardcoded_password", "high"),
+    (re.compile(r"(?i:api_?key|secret)\s*=\s*['\"]([^'\"]*)"), "hardcoded_secret", "high"),
     (re.compile(r'f[\'"].*SELECT.*\{.*\}'), "fstring_sql", "med"),
     (re.compile(r"\.execute\(\s*[\'\"]\s*SELECT.*\+"), "concat_sql", "med"),
     (re.compile(r"verify\s*=\s*False"), "tls_verify_false", "med"),
     (re.compile(r"\bmd5\b|\bsha1\b"), "weak_hash", "low"),
+    # -- JS/TS patterns (#1935 Tier 1) -------------------------------------
+    # Measured on the same 17-repo, 1109-file corpus as the exec_call/secret
+    # fixes in #1947. Three of these five needed tightening before they were
+    # shippable; see docs/layers/SECURITY.md and the PR body for the
+    # first-cut vs. after-tightening counts per pattern.
+    #
+    # ``__html: <value>`` is the React ``dangerouslySetInnerHTML`` shape. A
+    # pinned string literal there is inert; the interesting case is a value
+    # that is an identifier, a member access or a call. The value test has to
+    # be stated positively (an identifier/`$`/`(` lead character) rather than
+    # as a negative lookahead excluding quotes: after the variable-width
+    # `\s*` before it, a negative lookahead is tried at the position *before*
+    # the whitespace, where "not a quote" trivially succeeds and a string
+    # literal slips through anyway. Severity is ``med``, not ``high``: on the
+    # measured corpus every hit was a name reference to a source-pinned
+    # constant (a stylesheet string assigned to a module-level name), which
+    # this test cannot distinguish from a genuinely dynamic value without
+    # dataflow, so the pattern is a places-to-read signal rather than a
+    # confirmed sink.
+    (re.compile(r"__html\s*:\s*(?=[A-Za-z_$(])"), "unsafe_inner_html", "med"),
+    # Analogue of ``fstring_sql`` for a JS/TS template literal. The bare verb
+    # `SELECT` or `UPDATE` is an ordinary English word and fires on prose
+    # (`` `Order update failed: ${status}` ``) and even on class names
+    # (`select-none`), so each verb needs its companion clause —
+    # `SELECT`..`FROM`, `UPDATE`..`SET` — before an interpolation counts.
+    (
+        re.compile(r"`[^`\n]*\b(?:SELECT\b[^`\n]*\bFROM|UPDATE\b[^`\n]*\bSET)\b[^`\n]*\$\{"),
+        "template_literal_sql",
+        "med",
+    ),
+    # A secret-shaped name exposed through a `NEXT_PUBLIC_`/`VITE_` prefix
+    # ships straight into the client bundle. The prefix needing the most care
+    # against legitimate public config: an `..._ANON_...` name (a Supabase
+    # anon key, public by design and meant to be paired with RLS) is excluded
+    # rather than flagged, since that class made up most of the corpus noise.
+    (
+        re.compile(
+            r"\b(?:NEXT_PUBLIC|VITE)_(?!\w*ANON)[A-Z0-9_]*"
+            r"(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*\b"
+        ),
+        "public_env_secret",
+        "high",
+    ),
+    (re.compile(r"\bnew\s+Function\s*\("), "new_function_call", "high"),
+    # Analogue of ``tls_verify_false`` for Node's https/tls agent options.
+    (re.compile(r"rejectUnauthorized\s*:\s*false"), "reject_unauthorized_false", "med"),
 ]
 
 # Combined prefilter: one search per line rejects the (overwhelmingly common)
@@ -327,13 +428,21 @@ class SecurityScanner:
         findings.extend(_call_findings(file_path, source))
 
         # Line-by-line pattern scan
+        is_low_sev_file = _is_low_severity_path(file_path)
         for lineno, line in enumerate(lines, start=1):
             if not _ANY_PATTERN.search(line):
                 continue
             for pattern, kind, severity in _PATTERNS:
                 if kind in _CALL_KINDS:
                     continue
-                if pattern.search(line):
+                match = pattern.search(line)
+                if match:
+                    if kind in SECRET_KINDS:
+                        val = match.group(1) if match.groups() else ""
+                        if not _is_valid_credential_value(val):
+                            continue
+                        if is_low_sev_file:
+                            severity = "low"
                     # Trim snippet to keep it concise
                     snippet = line.strip()[:120]
                     findings.append(

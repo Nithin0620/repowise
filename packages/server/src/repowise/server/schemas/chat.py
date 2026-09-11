@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,6 +30,8 @@ class ChatPageContext(BaseModel):
         "contributor",
         "decision",
         "risk",
+        "dead-code",
+        "blast-radius",
         "security",
         "usage",
         "settings",
@@ -42,6 +44,7 @@ class ChatPageContext(BaseModel):
             "path",
             "symbol",
             "module",
+            "dependency",
             "commit",
             "person",
             "decision",
@@ -121,3 +124,46 @@ class ChatMessageResponse(BaseModel):
             content=content,
             created_at=obj.created_at,  # type: ignore[attr-defined]
         )
+
+
+class ChatArtifactEnvelope(BaseModel):
+    """One completed tool call, as stored inside a chat message.
+
+    ``data`` and ``evidence`` stay open: ``data`` is the raw result of
+    whichever MCP tool ran (a different shape per tool) and ``evidence`` is
+    derived from it, so closing either would turn tool variance into a 500.
+    """
+
+    id: str
+    version: int = 1
+    type: str
+    tool_name: str
+    title: str
+    presentation: str
+    data: dict[str, Any] = {}
+    evidence: dict[str, Any] = {}
+    pinned: bool = False
+    #: Absent on rows written before the envelope carried one; the legacy
+    #: normalizer backfills every other key but not this.
+    created_at: str | None = None
+
+
+class ChatSuggestion(BaseModel):
+    """One composer chip. ``source`` lets a client rank a measured question
+    above the static tier it already ships."""
+
+    text: str
+    source: Literal["static", "page", "followup"]
+    toolHint: str | None = None  # noqa: N815 - wire shape is camelCase
+
+
+class ChatSuggestionsResponse(BaseModel):
+    """Only the measured tier. An empty list means the page had nothing to
+    measure, and the client's own static tier stands."""
+
+    suggestions: list[ChatSuggestion] = []
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation: ConversationResponse
+    messages: list[ChatMessageResponse] = []

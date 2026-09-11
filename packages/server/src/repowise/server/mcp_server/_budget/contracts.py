@@ -21,10 +21,15 @@ from repowise.server.mcp_server._budget.budgeter import (
     truncate_to_budget,
 )
 from repowise.server.mcp_server._budget.collector import OmissionCollector
+from repowise.server.mcp_server._budget.hooks import run_post_enforce, run_post_shed
 
 DEFAULT_RESPONSE_CHARS = 24_000
 EXPANDED_RESPONSE_CHARS = 32_000
 _FINAL_HEADROOM_CHARS = 1_200
+
+#: Floor for a long text field the guard trims in place. Below this the excerpt
+#: stops being worth reading and the omission ref is the whole answer.
+_MIN_KEPT_TEXT_CHARS = 800
 
 
 @dataclass(frozen=True)
@@ -35,10 +40,25 @@ class ResponseBudgetContract:
     shed_order: tuple[str, ...] = ()
     expansion_argument: str | None = "include"
     protected: tuple[str, ...] = ()
+    #: Counts this tool derives by walking the indexed graph, named in
+    #: ``_meta.floor`` when present. An edge the index failed to resolve is
+    #: uncounted rather than proven absent, so the count is a lower bound.
+    #: A ``<field>_total`` name here is also read as a reduction total.
+    floor_fields: tuple[str, ...] = ()
 
+
+#: What a tool gets when it declares no priority of its own. An empty shed
+#: order leaves the ordinary pass a no-op; the final size guard is what this
+#: buys. Declining to rank your evidence has the guard rank it, and is never a
+#: choice to be delivered unbounded.
+_DEFAULT_CONTRACT = ResponseBudgetContract("blocks")
 
 _CONTRACTS: dict[str, ResponseBudgetContract] = {
-    "get_context": ResponseBudgetContract("targets", protected=("targets",)),
+    "get_context": ResponseBudgetContract(
+        "targets",
+        protected=("targets",),
+        floor_fields=("callers_total",),
+    ),
     "get_risk": ResponseBudgetContract(
         "blocks",
         (
@@ -51,6 +71,12 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "targets[]",
         ),
         protected=("directive", "targets"),
+        floor_fields=(
+            "dependents_count",
+            "dependents_total",
+            "impact_surface_total",
+            "co_change_partners_total",
+        ),
     ),
     "get_change_risk": ResponseBudgetContract(
         "blocks",
@@ -58,11 +84,13 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             # Cheapest loss first. Diff-shape context and history go before the
             # delta and the tests, so what to do survives what the diff weighs.
             "exclude_patterns",
+            "change_shape.independent_changes",
             "change_shape",
             "fix_history.files[]",
             "fix_history.files",
             "fix_history",
             "prior_fixes",
+            "branch_overlap",
             "cross_repo",
             "impacted_tests",
             "health_delta.limits",
@@ -96,7 +124,7 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "fallback_targets",
         ),
         expansion_argument="include",
-        protected=("answer", "confidence", "citations", "next_action_hint"),
+        protected=("answer", "confidence", "citations", "next_action_hint", "degraded"),
     ),
     # Whole-block drops served 0 of 50 pages, 0 of 12 episodes and 0 of 58
     # mined rationale comments across the two modes. Trimming runs to
@@ -112,6 +140,11 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             # Every tail trimmed before any lane is dropped, cheapest loss
             # first. Episodes last here; the path fitter sheds them first for a
             # different reason, documented on _fit_path_response.
+            # Candidates before accepted decisions: a candidate is a review
+            # request, so losing one to the budget costs the reader nothing
+            # they were meant to act on now.
+            "history[]",
+            "candidates[]",
             "decisions[]",
             "git_archaeology.file_commits[]",
             "git_archaeology.cross_references[]",
@@ -125,6 +158,8 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "git_archaeology.git_log",
             "related_documentation",
             "code_rationale",
+            "history",
+            "candidates",
             "origin_story",
         ),
         expansion_argument=None,
@@ -202,6 +237,123 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "gap_analysis",
         ),
     ),
+    # The tool caps source at 600 *lines*, and 600 lines of dense code measured
+    # 79k chars — far past the ceiling that line cap was sized against. Callee
+    # bodies are context for the root symbol, so they go first. ``source`` is
+    # protected so the guard trims it to what fits rather than dropping it: a
+    # symbol read with no body is a wasted call even with a recoverable ref.
+    "get_symbol": ResponseBudgetContract(
+        "blocks",
+        ("callee_bodies.callees[]", "candidates[]"),
+        expansion_argument=None,
+        protected=(
+            "source",
+            "symbol_id",
+            "file",
+            "name",
+            "qualified_name",
+            "signature",
+            "kind",
+            "start_line",
+            "end_line",
+            "verified",
+            "continuation",
+            "continuation_reference",
+            "error",
+        ),
+    ),
+    # Same order the tool used, enforced where the size is rechecked after the
+    # trust envelope: its own pass reserved 400 chars for a collector and the
+    # metadata that followed added roughly 2.6k.
+    "search_codebase": ResponseBudgetContract(
+        "blocks",
+        ("candidates", "results[]"),
+        expansion_argument=None,
+        protected=("results", "mode", "exact_match"),
+    ),
+    "get_dead_code": ResponseBudgetContract(
+        "blocks",
+        # Same order the tool used for its own pass, then the ranked tiers
+        # themselves, least-confident first.
+        (
+            "impact",
+            "by_directory",
+            "by_owner",
+            "tiers.low.findings[]",
+            "tiers.medium.findings[]",
+            "tiers.high.findings[]",
+        ),
+        expansion_argument=None,
+        protected=("summary", "tiers", "workspace", "error", "finding", "resolved"),
+    ),
+    # One ranked list. ``total_entry_points`` is derived before shedding, so
+    # the count stays exact.
+    "get_execution_flows": ResponseBudgetContract(
+        "blocks",
+        ("flows[]",),
+        expansion_argument=None,
+        protected=("total_entry_points",),
+    ),
+    "get_dependency_path": ResponseBudgetContract(
+        "blocks",
+        (
+            "visual_context.shared_neighbors",
+            "visual_context.bridge_suggestions",
+            "visual_context.nearest_common_ancestors",
+            "visual_context",
+        ),
+        expansion_argument=None,
+        protected=("distance", "explanation"),
+    ),
+    # These three cap their one list at 25 rows by construction and measured
+    # under 1.4k. They publish integer ``*_truncated`` counts of their own,
+    # which a shed order would overwrite with a bool, so they declare none and
+    # ride the size guard.
+    "get_architecture": ResponseBudgetContract(
+        "blocks",
+        ("role_breakdown",),
+        expansion_argument=None,
+        protected=("summary", "architecture_type", "score", "core_members", "error"),
+    ),
+    "get_conformance": ResponseBudgetContract(
+        "blocks",
+        expansion_argument=None,
+        protected=("summary", "violation_count", "cycle_count", "total_cycles", "error"),
+    ),
+    "get_blast_radius": ResponseBudgetContract(
+        "blocks",
+        ("impact_score_semantics",),
+        expansion_argument=None,
+        protected=("summary", "targets", "total_impacted", "unresolved_targets"),
+    ),
+    "list_repos": ResponseBudgetContract(
+        "blocks",
+        ("repos[]",),
+        expansion_argument=None,
+        protected=("workspace", "workspace_root", "default_repo"),
+    ),
+    # No shed order: the enabled path returns generated code whose shape we
+    # have not measured, and ranking blocks we have not seen would be a guess.
+    # It rides the final size guard until someone measures it.
+    "generate_refactoring_code": ResponseBudgetContract(
+        "blocks",
+        expansion_argument=None,
+        protected=("suggestion_id", "resolved", "error"),
+    ),
+    # Same shape as generate_refactoring_code: a small fixed write response
+    # whose fields are all load-bearing. No shed order — nothing to rank.
+    "set_finding_status": ResponseBudgetContract(
+        "blocks",
+        expansion_argument=None,
+        protected=(
+            "id",
+            "public_id",
+            "status",
+            "status_reason",
+            "status_changed_at",
+            "note",
+        ),
+    ),
 }
 
 
@@ -235,6 +387,75 @@ def _stamp_accounting(result: dict[str, Any], *, limit: int, tier: str) -> None:
         if budget["serialized_chars"] == measured:
             break
         budget["serialized_chars"] = measured
+
+
+def _stamp_completeness(
+    result: dict[str, Any], contract: ResponseBudgetContract
+) -> None:
+    """Roll the per-collection reduction counts up into one ``_meta`` block.
+
+    Every reducing pass already leaves ``<field>_total`` beside
+    ``<field>_emitted`` and a ``<field>_reduced_reason``, and reading them
+    takes a caller a walk of the whole response. The sum spans every counted
+    collection, so it says how much of what this call was going to return
+    survived, not what share of the repository the caller now holds: a tool's
+    own result limit applies before any of these counters exist.
+    """
+    shown = 0
+    total = 0
+    counted = False
+    dropped_by_reason: dict[str, int] = {}
+    floors: set[str] = set()
+    wanted = set(contract.floor_fields)
+
+    def record(field_total: int, emitted: int, reason: Any) -> None:
+        nonlocal shown, total, counted
+        counted = True
+        total += field_total
+        shown += emitted
+        if isinstance(reason, str):
+            dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + max(
+                0, field_total - emitted
+            )
+
+    def visit(node: dict[str, Any]) -> None:
+        for key, value in node.items():
+            if key in wanted and isinstance(value, int) and not isinstance(value, bool):
+                floors.add(key)
+            if isinstance(value, dict):
+                visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        visit(item)
+            elif key.endswith("_total") and isinstance(value, int):
+                stem = key[: -len("_total")]
+                emitted = node.get(f"{stem}_emitted")
+                if isinstance(emitted, int):
+                    record(value, emitted, node.get(f"{stem}_reduced_reason"))
+
+    visit({key: value for key, value in result.items() if key != "_meta"})
+
+    meta = result.setdefault("_meta", {})
+    # A block dropped whole is recorded here instead of as sibling counts.
+    for row in meta.get("reductions") or []:
+        if isinstance(row, dict) and isinstance(row.get("total"), int):
+            record(row["total"], int(row.get("emitted") or 0), row.get("reason"))
+
+    completeness: dict[str, Any] = {
+        "capped": shown < total or bool(result.get("truncated"))
+    }
+    # "0 of 0" is a collection that had nothing to reduce, and reads as
+    # nothing served.
+    if counted and total:
+        completeness["shown"] = shown
+        completeness["total"] = total
+    if completeness["capped"] and dropped_by_reason:
+        # Whichever pass dropped the most rows is the one worth acting on.
+        completeness["reason"] = max(dropped_by_reason.items(), key=lambda row: row[1])[0]
+    meta["completeness"] = completeness
+    if floors:
+        meta["floor"] = sorted(floors)
 
 
 async def resolve_response_budget_repo_root(
@@ -282,8 +503,12 @@ def _emergency_fit(
         value = result.pop(key)
         collector.add(f"{key} removed by final budget guard", value)
         if isinstance(value, list):
-            result[f"{key}_total"] = len(value)
+            # An earlier pass may already have trimmed this list, so its total
+            # describes the population, not what is left to drop here.
+            total = max(len(value), int(result.get(f"{key}_total") or 0))
+            result[f"{key}_total"] = total
             result[f"{key}_emitted"] = 0
+            result[f"{key}_omitted"] = total
             result[f"{key}_reduced_reason"] = "response_budget"
         result["truncated"] = True
 
@@ -347,27 +572,14 @@ def _emergency_fit(
         else:
             marker = collector.add_inline(path, value)
             suffix = f"\n{marker}" if marker else "\n[reduced to fit]"
-            container[key] = value[: max(0, 800 - len(suffix))] + suffix
+            # Keep as much as the budget actually allows rather than a fixed
+            # floor: cutting a 33k body to 800 characters costs the caller the
+            # whole read to save bytes the budget never asked for.
+            room = limit - (before - len(value)) - len(suffix)
+            container[key] = value[: max(_MIN_KEPT_TEXT_CHARS, room)] + suffix
         result["truncated"] = True
         if response_chars(result) >= before:
             return
-
-
-def _reconcile_health_plan_status(result: dict[str, Any]) -> None:
-    """Keep plan availability honest after the final budget mutates collections."""
-    status = result.get("refactoring_plans_status")
-    plans = result.get("refactoring_plans")
-    if not isinstance(status, dict) or status.get("state") != "available":
-        return
-    if plans is not None and (not isinstance(plans, list) or plans):
-        return
-    if not result.get("refactoring_plans_total", 0):
-        return
-    status.update(
-        state="available_not_emitted",
-        reason="response_budget",
-        message="Plans exist but were removed by the final response budget.",
-    )
 
 
 def enforce_response_budget(
@@ -379,10 +591,15 @@ def enforce_response_budget(
     kwargs: dict[str, Any],
     repo_root: str | Path | None = None,
 ) -> Any:
-    """Apply *tool*'s contract to its final, metadata-complete result."""
-    contract = _CONTRACTS.get(tool)
-    if contract is None or not isinstance(result, dict):
+    """Apply *tool*'s contract to its final, metadata-complete result.
+
+    A tool with no declared contract is budgeted under :data:`_DEFAULT_CONTRACT`
+    rather than returned untouched: an undeclared priority is a missing shed
+    order, never a claim that the response is small.
+    """
+    if not isinstance(result, dict):
         return result
+    contract = _CONTRACTS.get(tool, _DEFAULT_CONTRACT)
 
     if repo_root is None:
         from repowise.server.mcp_server import _state
@@ -416,33 +633,7 @@ def enforce_response_budget(
             headroom=0,
             record_counts=True,
         )
-        if tool == "get_why":
-            # Re-derived after shedding: the basis names a lane, and a lane
-            # this pass emptied must not leave the claim standing.
-            from repowise.server.mcp_server.tool_why import _stamp_answer_basis
-
-            _stamp_answer_basis(result)
-        if tool == "get_health":
-            plans = result.get("refactoring_plans")
-            profiles = result.get("validation_profiles")
-            if isinstance(plans, list) and isinstance(profiles, list):
-                referenced = {
-                    plan.get("validation_profile_id")
-                    for plan in plans
-                    if isinstance(plan, dict) and plan.get("validation_profile_id")
-                }
-                kept_profiles = [
-                    profile
-                    for profile in profiles
-                    if isinstance(profile, dict) and profile.get("id") in referenced
-                ]
-                dropped_profiles = [profile for profile in profiles if profile not in kept_profiles]
-                if dropped_profiles:
-                    collector.add("validation_profiles no longer referenced after response budgeting", dropped_profiles)
-                    result["validation_profiles"] = kept_profiles
-                    result["validation_profiles_emitted"] = len(kept_profiles)
-                    result["validation_profiles_reduced_reason"] = "response_budget"
-                    result["truncated"] = True
+        run_post_shed(tool, result, collector)
         collector.attach(result)
 
     if response_chars(result) > limit:
@@ -450,11 +641,11 @@ def enforce_response_budget(
         _emergency_fit(result, contract, emergency, working_limit)
         emergency.attach(result)
 
-    if tool == "get_health":
-        _reconcile_health_plan_status(result)
+    run_post_enforce(tool, result)
 
     if result.get("truncated"):
         result.setdefault("_meta", {}).setdefault("state", {})["truncated"] = True
+    _stamp_completeness(result, contract)
     _stamp_accounting(result, limit=limit, tier=tier)
     if response_chars(result) > limit:
         result.setdefault("_meta", {}).setdefault("response_budget", {})[

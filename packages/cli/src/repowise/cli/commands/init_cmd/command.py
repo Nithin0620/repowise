@@ -30,6 +30,7 @@ from repowise.cli.editor_setup import (
     select_agents_interactively,
     write_editor_project_files,
 )
+from repowise.cli.errors import reasoned_error
 from repowise.cli.helpers import (
     config_fingerprint,
     console,
@@ -47,7 +48,6 @@ from repowise.cli.helpers import (
     save_config_partial,
     save_state,
 )
-from repowise.cli.platform import telemetry
 from repowise.cli.providers import resolve_embedder
 from repowise.cli.providers.embedders import embedder_was_requested as _embedder_was_requested
 from repowise.cli.state_persistence import build_kg_state, save_knowledge_graph_json
@@ -156,6 +156,60 @@ def _record_init_outcome(
         return
 
 
+def _print_structural_plan(
+    *,
+    result: Any,
+    repo_path: Path,
+    concurrency: int,
+    language: str,
+    onboarding: bool,
+    wiki_style: str,
+    max_file_pages: int | None,
+    skip_tests: bool,
+    skip_infra: bool,
+) -> None:
+    """The plan a dry run owes the deterministic branch.
+
+    ``build_generation_plan`` is provider-free, so the same selector that
+    generation would run gives the real per-type counts. A raw file count
+    would not: ``select_pages`` caps file pages, and module, onboarding and
+    infra pages are not in it at all.
+    """
+    from repowise.core.cost_estimator import build_generation_plan
+    from repowise.core.generation import GenerationConfig
+
+    gen_config = GenerationConfig.from_repo_config(
+        load_config(repo_path),
+        deterministic=True,
+        max_concurrency=concurrency,
+        language=language,
+        enable_onboarding=onboarding,
+        wiki_style=wiki_style,
+        max_file_pages=max_file_pages,
+    )
+    kg_modules = getattr(getattr(result, "knowledge_graph_result", None), "modules", None) or None
+    plans = build_generation_plan(
+        result.parsed_files,
+        result.graph_builder,
+        gen_config,
+        skip_tests,
+        skip_infra,
+        kg_modules=kg_modules,
+    )
+
+    table = Table(title="Generation Plan (dry run)", border_style=BRAND)
+    table.add_column("Pages", style="cyan")
+    table.add_column("Count", justify="right")
+    total = 0
+    for plan in plans:
+        total += plan.count
+        table.add_row(page_type_label(plan.page_type), f"{plan.count:,}")
+    table.add_section()
+    table.add_row("[bold]Total[/bold]", f"[bold]{total:,}[/bold]")
+    console.print(table)
+    console.print("  Dry run: every page above is rendered from structure. No wiki written.")
+
+
 def _run_deterministic_generation_phase(
     *,
     repo_path: Path,
@@ -169,6 +223,7 @@ def _run_deterministic_generation_phase(
     embedder_name_resolved: str,
     embedder_was_requested: bool,
     resume: bool,
+    timings: Any | None = None,
 ) -> str:
     """Render the whole wiki from templates, for ``init --index-only``.
 
@@ -244,6 +299,7 @@ def _run_deterministic_generation_phase(
         embedder_name_resolved=embedder,
         resume=resume,
         verbose=True,
+        timings=timings,
     )
     return embedder
 
@@ -267,6 +323,8 @@ def _run_generation_phase(
     embedder_name_resolved: str,
     resume: bool,
     test_run: bool,
+    timings: Any | None = None,
+    warnings: list[str] | None = None,
 ) -> tuple[bool, bool]:
     """Run the LLM generation phase for a single-repo init.
 
@@ -396,6 +454,8 @@ def _run_generation_phase(
         resume=resume,
         verbose=True,
         test_run=test_run,
+        timings=timings,
+        warnings=warnings,
     )
     return False, False
 
@@ -403,6 +463,25 @@ def _run_generation_phase(
 # ---------------------------------------------------------------------------
 # CLI command
 # ---------------------------------------------------------------------------
+
+
+def _interactive_gate(
+    *,
+    isatty: bool,
+    provider_name: str | None,
+    index_only: bool,
+    yes: bool,
+    resume: bool,
+) -> bool:
+    """Whether the interactive questionnaire runs.
+
+    Interactive requires a TTY, no explicit provider, docs on, and neither
+    --yes nor --resume. --resume skips the gate because the prior run
+    already answered every question and those answers are on disk
+    (config.yaml); re-asking would let a resumed run diverge from the pages
+    already written with them (issue #2098).
+    """
+    return isatty and provider_name is None and not index_only and not yes and not resume
 
 
 @click.command("init")
@@ -433,10 +512,23 @@ def _run_generation_phase(
 @click.option("--skip-tests", is_flag=True, default=False, help="Skip test files.")
 @click.option("--skip-infra", is_flag=True, default=False, help="Skip infrastructure files.")
 @click.option(
-    "--dry-run", is_flag=True, default=False, help="Show generation plan without running."
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    # "No wiki", not "writes nothing": the pipeline still warms its parse and
+    # duplication caches, which are derived data.
+    help="Show the generation plan and cost estimate. Writes no wiki.",
 )
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip cost confirmation prompt.")
-@click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint.")
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip pages already generated in the vector store and continue from "
+        "where a previous run stopped. Safe no-op on a fully indexed repo."
+    ),
+)
 @click.option(
     "--force", is_flag=True, default=False, help="Regenerate all pages, ignoring existing."
 )
@@ -545,6 +637,19 @@ def _run_generation_phase(
         "consent, and this flag decides all four without a prompt. Default: "
         "ask when interactive, skip otherwise. In workspace mode the verdict "
         "applies to every selected repo."
+    ),
+)
+@click.option(
+    "--hook/--no-hook",
+    "hook",
+    default=None,
+    help=(
+        "Install the post-commit hook that runs `repowise update` after each "
+        "commit, so the index stays current without anyone typing it. Default: "
+        "on. Interactive runs ask; --yes and non-interactive runs install it and "
+        "print how to undo it (`repowise hook uninstall`). --no-hook skips it. "
+        "--no-editor-setup skips it too, since a git hook is a write outside "
+        ".repowise/. In workspace mode the choice applies to every selected repo."
     ),
 )
 @click.option(
@@ -726,6 +831,7 @@ def init_command(
     agents_md: bool | None,
     codex_setup: bool | None,
     distill_hook: bool | None,
+    hook: bool | None,
     editor_setup: bool,
     save_key: bool,
     include_submodules: bool,
@@ -786,8 +892,7 @@ def init_command(
     repo_path = resolve_repo_path(path)
 
     if not repo_path.is_dir():
-        telemetry.add_command_outcome(failure_reason="invalid_path")
-        raise click.ClickException(f"Not a directory: {repo_path}")
+        raise reasoned_error(f"Not a directory: {repo_path}", reason="invalid_path")
 
     # ---- Workspace detection ----
     # If the path contains multiple git repos (and is not itself a single repo),
@@ -812,8 +917,10 @@ def init_command(
     if seed_from:
         seed_base = Path(seed_from).resolve()
         if seed_base == repo_path.resolve():
-            telemetry.add_command_outcome(failure_reason="seed_from_is_target")
-            raise click.ClickException("--seed-from cannot be the same as the target directory.")
+            raise reasoned_error(
+                "--seed-from cannot be the same as the target directory.",
+                reason="seed_from_is_target",
+            )
     elif not no_seed and not (repo_path / ".repowise" / "state.json").exists():
         detected = detect_worktree_base(repo_path)
         if detected is not None and base_is_seedable(detected):
@@ -888,6 +995,7 @@ def init_command(
             agents_md=agents_md,
             codex_setup=codex_setup,
             distill_hook=distill_hook,
+            hook=hook,
             editor_setup=editor_setup,
             save_key=save_key,
             include_submodules=include_submodules,
@@ -935,7 +1043,23 @@ def init_command(
     # ---- Interactive mode (TTY, no explicit flags) ----
     # --yes forces non-interactive even on a TTY (mirrors the workspace path),
     # so a scripted `init -y` never blocks on the mode-selection menu.
-    is_interactive = sys.stdin.isatty() and provider_name is None and not index_only and not yes
+    # --resume skips the gate too: the prior run already answered every
+    # question, and those answers are on disk (config.yaml), so re-asking
+    # would let a resumed run diverge from the pages already written with
+    # them (issue #2098).
+    is_interactive = _interactive_gate(
+        isatty=sys.stdin.isatty(),
+        provider_name=provider_name,
+        index_only=index_only,
+        yes=yes,
+        resume=resume,
+    )
+
+    if resume:
+        console.print(
+            f"[bold]Resuming[/] the previous run in {repo_path}, "
+            "reusing the answers it already saved to config.yaml."
+        )
 
     # Output language picked in the advanced-mode generation section; None
     # until chosen. Resolved below: flag > this > config.yaml > English.
@@ -1144,10 +1268,10 @@ def init_command(
             "written versions stay in page history."
         )
         if not sys.stdin.isatty():
-            telemetry.add_command_outcome(failure_reason="wiki_overwrite_unconfirmed")
-            raise click.ClickException(
+            raise reasoned_error(
                 "Refusing to replace a model-written wiki with template pages. "
-                "Re-run with --yes to confirm, or drop --index-only."
+                "Re-run with --yes to confirm, or drop --index-only.",
+                reason="wiki_overwrite_unconfirmed",
             )
         if not click.confirm("  Replace the written wiki with template pages?", default=False):
             console.print("[dim]Nothing changed.[/dim]")
@@ -1261,8 +1385,10 @@ def init_command(
                         )
                     )
                 except ProviderError as exc:
-                    telemetry.add_command_outcome(failure_reason="provider_validation_failed")
-                    raise click.ClickException(f"Provider validation failed: {exc}") from exc
+                    raise reasoned_error(
+                        f"Provider validation failed: {exc}",
+                        reason="provider_validation_failed",
+                    ) from exc
             console.print(f"  [{OK}]✓[/] Provider connection verified")
 
     # ---- Phase 1 & 2: Ingestion + Analysis (always) ----
@@ -1275,7 +1401,9 @@ def init_command(
     # the run isn't wasted, and propagate the choice to the persisted docs
     # mode so subsequent updates default to index-only.
     cost_declined = False
-    llm_client = provider if not index_only else decision_provider
+    # None on a dry run: decision extraction and KG enrichment both call this
+    # client before the generation phase's dry-run return is reached.
+    llm_client = None if dry_run else (provider if not index_only else decision_provider)
 
     from repowise.core.pipeline import PhaseTimingRecorder, run_pipeline
     from repowise.core.pipeline.modes import OrchestratorMode
@@ -1302,6 +1430,10 @@ def init_command(
         # durations without changing the pipeline API. Timings get
         # persisted to state.json below.
         callback = PhaseTimingRecorder(rich_callback)
+        # The denominator. Phases nest (``persist.fts`` inside ``persist``)
+        # and some overlap, so the totals can exceed it - without it there is
+        # no way to tell an unrecorded stage from an overlapping one.
+        callback.table.start("run")
 
         # Always run ingestion + analysis first (generate_docs=False).
         # Generation happens separately after cost confirmation.
@@ -1366,21 +1498,41 @@ def init_command(
             )
             return
 
-    # Surface per-phase timing data to the caller — both for the
-    # state.json persistence below and for any future "profile" tooling
-    # that wants to introspect a run.
-    phase_timings: dict[str, float] = callback.timings
-    # Same idea, for the failures rather than the durations: what the run
-    # degraded on, in a place an agent can read after the terminal is gone.
+    # What the run degraded on, in a place an agent can read after the
+    # terminal is gone. Timings are read after persistence instead, so
+    # generation and the persist tail are in the table too.
     run_warnings: list[str] = list(rich_callback.warnings)
 
     # ---- Analysis summary (shown between analysis and generation) ----
     show_analysis_summary(result)
 
     # ---- Phase 3: Generation ----
+    # The priced branch below has its own dry-run return; these two rendered
+    # the template wiki and fell through to persistence, overwriting a
+    # model-written one. Same shape as #2005 (update) and #1526 (workspace).
+    if dry_run and (index_only or no_provider):
+        if run_mode == "fast":
+            # Fast skips generation outright, so promising a wiki here would
+            # preview the opposite of what the real run does.
+            console.print("\n  Dry run: fast mode indexes graph and git only. No wiki written.")
+        else:
+            _print_structural_plan(
+                result=result,
+                repo_path=repo_path,
+                concurrency=concurrency,
+                language=language,
+                onboarding=onboarding,
+                wiki_style=wiki_style,
+                max_file_pages=max_file_pages,
+                skip_tests=skip_tests,
+                skip_infra=skip_infra,
+            )
+        return
+
     # The embedder the template wiki was actually built with, persisted below
     # so `repowise update` reuses it. None means no template wiki was rendered.
     _index_only_embedder: str | None = None
+
     # Both modes generate. Index-only renders from templates; full mode picks
     # a coverage level, estimates the spend and prompts a model.
     #
@@ -1412,6 +1564,7 @@ def init_command(
             embedder_name_resolved=embedder_name_resolved,
             embedder_was_requested=embedder_was_requested,
             resume=resume,
+            timings=callback.table,
         )
     else:
         gen_stop, cost_declined = _run_generation_phase(
@@ -1435,7 +1588,9 @@ def init_command(
             # file. Resuming against it would skip the entire model run and
             # say nothing, so a template wiki is never a run to continue.
             resume=resume and _prior_docs_mode != "deterministic",
+            warnings=run_warnings,
             test_run=test_run,
+            timings=callback.table,
         )
         if gen_stop:
             return
@@ -1471,6 +1626,7 @@ def init_command(
                 embedder_was_requested=True,
                 embedder_name_resolved=embedder_name_resolved,
                 resume=resume,
+                timings=callback.table,
             )
 
     # ---- Persistence ----
@@ -1499,15 +1655,20 @@ def init_command(
         TimeElapsedColumn(),
         console=console,
     ) as persist_bar:
-        persist_callback = RichProgressCallback(persist_bar, console)
-        # Announced before the work starts and re-announced with a real total
-        # once the page loop knows one, so the stage is never silent.
+        persist_callback = callback.rebind(RichProgressCallback(persist_bar, console))
+        # Indeterminate: persistence has no page-proportional loop to count
+        # since the full-text index became a single statement. Announced here
+        # so the stage is never silent.
         persist_callback.on_phase_start("persist", None)
-        run_async(persist_result(result, repo_path, persist_callback))
+        run_async(persist_result(result, repo_path, persist_callback, callback.table))
         persist_callback.on_phase_done("persist")
     # Persistence has its own callback, so its warnings need folding into the
     # run record explicitly — the state write below is the last chance.
     run_warnings.extend(persist_callback.warnings)
+    # Read now, not before generation: ingestion, analysis, generation and
+    # persistence all write into the one table.
+    callback.table.stop("run")
+    phase_timings: dict[str, float] = callback.timings
     console.print(f"  [{OK}]✓[/] Database updated")
 
     # Persist the onboarding choice so subsequent `repowise update` runs
@@ -1682,8 +1843,14 @@ def init_command(
         embedder_name_resolved=embedder_name_resolved,
     )
 
-    # Offer to install post-commit hook (both index-only and full modes)
-    offer_hook_install(console, [repo_path], yes=yes)
+    # Post-commit auto-sync hook (both index-only and full modes)
+    offer_hook_install(
+        console,
+        [repo_path],
+        flag=hook,
+        yes=yes,
+        no_editor_setup=not editor_setup,
+    )
 
     # Opt-in distill command-rewrite hook for Claude Code. The workspace flow
     # runs its own offer across all selected repos inside _workspace_init.

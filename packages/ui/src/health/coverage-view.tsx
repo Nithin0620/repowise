@@ -21,6 +21,7 @@
 import { useMemo, useState } from "react";
 import { ArrowUpRight, Sparkles } from "lucide-react";
 import useSWR from "swr";
+import { GOOD_MIN } from "@repowise-dev/types/health";
 import type {
   CoverageFileRow,
   HealthCoverageResponse,
@@ -190,7 +191,7 @@ function CoverageBody({
           f.total_coverable_lines > 0 &&
           f.line_coverage_pct != null &&
           f.line_coverage_pct < 30 &&
-          (f.health_score == null || f.health_score < 6),
+          (f.health_score == null || f.health_score < GOOD_MIN),
       )
       .slice(0, 10)
       .map((f) => {
@@ -328,7 +329,7 @@ function CoverageBody({
     },
     {
       key: "health_score",
-      header: "Health",
+      header: "Code health",
       priority: 2,
       align: "right",
       sortable: true,
@@ -365,7 +366,7 @@ function CoverageBody({
             });
           }}
           title="Generate AI test prompt for this file"
-          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-success)] hover:bg-[var(--color-success)]/10 transition-colors"
+          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-model)] hover:bg-[var(--color-model-muted)] transition-colors"
         >
           <Sparkles className="h-3.5 w-3.5" />
         </button>
@@ -557,7 +558,7 @@ const gapColumns: ResponsiveColumn<ReachedFileRow>[] = [
   },
   {
     key: "health_score",
-    header: "Health",
+    header: "Code health",
     priority: 2,
     align: "right",
     render: (f) =>
