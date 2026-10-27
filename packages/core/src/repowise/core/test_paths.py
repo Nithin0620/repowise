@@ -579,12 +579,17 @@ def _classify(
 
     # Inside test material. A test-shaped filename wins; otherwise a
     # scaffolding directory or support stem demotes it to support.
-    if not named_test and (
-        any(seg in _SUPPORT_DIR_TOKENS for seg in segments)
-        or PurePosixPath(filename.lower()).stem in _SUPPORT_STEMS_IN_TEST_TREE
-    ):
+    if not named_test and _is_support_in_test_tree(segments, filename):
         return "support"
     return "test"
+
+
+def _is_support_in_test_tree(segments: list[str], filename: str) -> bool:
+    """Whether a file already inside a test tree is scaffolding (``e2e/fixtures.ts``)."""
+    return (
+        any(seg in _SUPPORT_DIR_TOKENS for seg in segments)
+        or PurePosixPath(filename.lower()).stem in _SUPPORT_STEMS_IN_TEST_TREE
+    )
 
 
 def _phpunit_skips(path: str, filename: str, roots: PhpunitRoots | None) -> bool:
