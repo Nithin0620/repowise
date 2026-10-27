@@ -44,13 +44,24 @@ function toPresentations<T extends Record<string, PresentationCopy | undefined>>
   ) as { [K in keyof T]: ChatContextPresentation };
 }
 
+/** The empty chat's questions: what chat can draw, for readers of either kind.
+ *  The empty state shows the first four. */
+export const EMPTY_CHAT_SUGGESTIONS: readonly string[] = [
+  "Chart code health by package as a treemap",
+  "Which files are riskiest to change, and why?",
+  "Show what kinds of changes we made each week",
+  "Give me a one-slide health summary with charts",
+  "Where are the biggest test coverage gaps?",
+  "What dead code can be safely removed?",
+];
+
 const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
   repository: {
     placeholder: "Ask about this repository, or paste a file path",
     suggestions: [
       "Give me an overview of this codebase",
-      "What are the highest-risk files to modify?",
-      "What architectural decisions have been made?",
+      "Chart code health by package as a treemap",
+      "Which files have the worst code health?",
       "What dead code can be safely removed?",
     ],
   },
@@ -59,7 +70,7 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
     suggestions: [
       "Explain the main architectural boundaries",
       "Which parts of this repository deserve attention first?",
-      "Where should a new contributor start?",
+      "Give me a one-slide health summary with charts",
     ],
   },
   documentation: {
@@ -74,7 +85,7 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
     placeholder: "Ask about this architecture view",
     suggestions: [
       "Explain the main component boundaries",
-      "Which dependencies create the most coupling?",
+      "Chart the architecture layers by file count",
       "Trace a request through this architecture",
     ],
   },
@@ -89,17 +100,17 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
   health: {
     placeholder: "Ask about these code health findings",
     suggestions: [
+      "Show health bands as a donut",
       "Which finding should I address first and why?",
-      "Explain the evidence behind the highest-risk finding",
       "Propose a safe refactoring sequence",
     ],
   },
   refactoring: {
-    placeholder: "Ask about this refactoring opportunity",
+    placeholder: "Ask about this repository's refactoring targets",
     suggestions: [
       "Turn this into a safe refactoring plan",
-      "Which tests should protect this change?",
-      "What could break if I modify these files?",
+      "Which refactoring opportunity is safest to start with?",
+      "Chart open findings by severity and package",
     ],
   },
   file: {
@@ -153,16 +164,16 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
   risk: {
     placeholder: "Ask about the risk evidence on this page",
     suggestions: [
+      "Top 10 files by bug fixes, rest as Other",
       "Explain the highest-risk result in plain language",
       "Which tests reduce the most uncertainty?",
-      "Propose the safest order for these changes",
     ],
   },
   "dead-code": {
     placeholder: "Ask about this dead-code result",
     suggestions: [
       "Is this safe to remove, and what still reaches it?",
-      "Explain the evidence behind this result",
+      "Dead code by kind and confidence tier",
       "What should I check before deleting it?",
     ],
   },
@@ -175,19 +186,19 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
     ],
   },
   security: {
-    placeholder: "Ask about these security findings",
+    placeholder: "Ask how this repository tracks security evidence",
     suggestions: [
-      "Which security finding should be investigated first?",
+      "How does this repository detect and track security findings?",
       "Explain the evidence without overstating certainty",
-      "Which code paths are affected?",
     ],
   },
   usage: {
-    placeholder: "Ask about usage and savings",
+    // Usage and billing figures live on the page, not behind any chat tool.
+    placeholder: "Ask about this repository (usage figures are on the page)",
     suggestions: [
-      "Explain the largest source of usage",
-      "Which figures are measured versus estimated?",
-      "Where could usage be reduced safely?",
+      "Give me an overview of this codebase",
+      "Which files have the worst code health?",
+      "What dead code can be safely removed?",
     ],
   },
   settings: {
@@ -200,12 +211,7 @@ const PRESENTATION_COPY: Record<ChatContextKind, PresentationCopy> = {
   },
   chat: {
     placeholder: "Ask a follow-up, or paste a file path",
-    suggestions: [
-      "Give me an overview of this codebase",
-      "What are the highest-risk files to modify?",
-      "Score the change risk of HEAD",
-      "What architectural decisions have been made?",
-    ],
+    suggestions: EMPTY_CHAT_SUGGESTIONS,
   },
 };
 
@@ -216,22 +222,19 @@ const COLLECTION_PRESENTATION_COPY: Partial<
     placeholder: "Ask about this repository's documentation",
     suggestions: [
       "Which documentation should I read first?",
-      "Where is documentation missing or stale?",
-      "Connect the documentation to its source files",
+      "Where should a new contributor start?",
     ],
   },
   file: {
     placeholder: "Ask about files in this repository",
     suggestions: [
       "Which files are the main entry points?",
-      "Find the files responsible for a feature",
-      "Which files are riskiest to modify?",
+      "Which files have the worst code health?",
     ],
   },
   symbol: {
     placeholder: "Ask about symbols in this repository",
     suggestions: [
-      "Find the symbol responsible for a behavior",
       "Which symbols have the widest impact?",
       "Show the most important public interfaces",
     ],
@@ -247,8 +250,8 @@ const COLLECTION_PRESENTATION_COPY: Partial<
   commit: {
     placeholder: "Ask about repository history",
     suggestions: [
-      "Summarize the most important recent changes",
-      "Which files change together most often?",
+      "Heatmap of changes by week and category",
+      "Review the risk of the latest commit",
       "Find the history behind an architectural choice",
     ],
   },

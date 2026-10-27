@@ -15,6 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from repowise.core.test_paths import is_test_support_path
+
 # -- File score --------------------------------------------------------
 
 # Bonuses applied additively on top of normalized PageRank+betweenness.
@@ -34,6 +36,16 @@ _PENALTY_TEST = 0.60
 _PENALTY_TRIVIAL_SIZE_BYTES = 4000
 _PENALTY_TRIVIAL_SYMBOL_CAP = 4
 _PENALTY_TRIVIAL = 0.40
+
+
+def is_test_spec(fi: Any) -> bool:
+    """A test proper: ``FileInfo.is_test`` less the support files around tests.
+
+    ``is_test`` covers both, but ``conftest.py``, ``tests/helpers/`` and
+    ``e2e/fixtures.ts`` carry the harness conventions a reader asks about, so
+    page selection treats them as code (#1497).
+    """
+    return fi.is_test and not is_test_support_path(fi.path, fi.language)
 
 
 def _normalize(value: float, max_value: float) -> float:
@@ -84,14 +96,9 @@ def score_file(
 
     base += kg_bonus
 
-    # Penalties. Actual test specs are penalized so substantive production code
-    # ranks higher under caps; test support/infrastructure files (fixtures, helpers)
-    # are preserved without penalty.
-    if fi.is_test:
-        from repowise.core.test_paths import is_test_support_path
-
-        if not is_test_support_path(fi.path, fi.language):
-            base *= _PENALTY_TEST
+    # Penalties.
+    if is_test_spec(fi):
+        base *= _PENALTY_TEST
     if (
         n_symbols <= _PENALTY_TRIVIAL_SYMBOL_CAP
         and fi.size_bytes < _PENALTY_TRIVIAL_SIZE_BYTES

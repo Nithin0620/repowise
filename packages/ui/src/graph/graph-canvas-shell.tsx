@@ -33,8 +33,20 @@ export interface GraphCanvasShellProps {
    * `footer` or `rail`.
    */
   overlay?: React.ReactNode | undefined;
+  /**
+   * `page` (default) fills a full-bleed page and pads its rows. `section` sits
+   * inside a padded page section: rows align with the section's text, and the
+   * canvas and rail share one hairline frame.
+   */
+  variant?: "page" | "section" | undefined;
   className?: string | undefined;
 }
+
+/** Row padding and canvas frame per variant. */
+const VARIANT = {
+  page: { pad: "px-4 sm:px-6", frame: "" },
+  section: { pad: "", frame: "overflow-hidden rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-root)]" },
+} as const;
 
 /**
  * The single canvas container for every graph surface.
@@ -54,12 +66,14 @@ export function GraphCanvasShell({
   rail,
   footer,
   overlay,
+  variant = "page",
   className,
 }: GraphCanvasShellProps) {
+  const { pad, frame } = VARIANT[variant];
   return (
     <div className={cn("flex h-full flex-col", className)}>
       {(breadcrumb || title || description || titleActions) && (
-        <div className="flex shrink-0 flex-wrap items-start justify-between gap-2 px-4 pt-3 sm:px-6">
+        <div className={cn("flex shrink-0 flex-wrap items-start justify-between gap-2 pt-3", pad)}>
           <div className="min-w-0 max-w-2xl">
             {breadcrumb && <div className="mb-1 min-w-0">{breadcrumb}</div>}
             {title && (
@@ -80,12 +94,13 @@ export function GraphCanvasShell({
           )}
         </div>
       )}
-      {banner && <div className="shrink-0 px-4 pt-3 sm:px-6">{banner}</div>}
+      {banner && <div className={cn("shrink-0 pt-3", pad)}>{banner}</div>}
 
       <div
         className={cn(
           "relative mt-3 grid min-h-0 flex-1",
           rail ? "lg:grid-cols-[minmax(0,1fr)_340px]" : "grid-cols-1",
+          frame,
         )}
       >
         {/* A floor, so a tall header or key row cannot squeeze the subject to
@@ -111,14 +126,22 @@ export function GraphCanvasShell({
             className={cn(
               // Bottom sheet under lg so the canvas keeps its height on a
               // phone; a real grid column from lg up.
-              // `--z-dropdown`, which is the raw `z-20` this used to carry
-              // spelled as the token. Deliberately NOT `--z-sidebar`: Radix
-              // tooltips and popovers portal to `body` at `--z-dropdown`, so a
-              // rail that outranked them would render its own tooltips behind
-              // itself. Equal, and later in the DOM, is what makes them land on
-              // top. It still clears the canvas chrome at `--z-elevated`, and
-              // still yields to the context menu and the help modal.
-              "absolute inset-x-0 bottom-0 z-[var(--z-dropdown)] flex max-h-[70%] flex-col overflow-hidden",
+              // `--z-sidebar`: the rail is a surface, and surfaces sit below
+              // every floating layer. It clears the canvas chrome at
+              // `--z-elevated` and yields to the context menu and the help
+              // modal at `--z-modal`.
+              //
+              // This used to be `--z-dropdown`, to tie with the Radix tooltips
+              // and popovers that portal to `body` — a rail that outranked them
+              // would have rendered its own tooltips behind itself, and equal
+              // plus later in the DOM was what put them on top. That tie is no
+              // longer needed: `--z-dropdown` now outranks every surface, so
+              // those tooltips land in front by the scale rather than by DOM
+              // order. Staying on `--z-dropdown` would instead drag this rail
+              // above `--z-modal`, and an open rail would paint over any dialog
+              // under `lg` (above `lg` it is `lg:static` and z-index stops
+              // applying). See `packages/ui/__tests__/z-layering.test.ts`.
+              "absolute inset-x-0 bottom-0 z-[var(--z-sidebar)] flex max-h-[70%] flex-col overflow-hidden",
               "rounded-t-xl border-t border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shadow-xl shadow-black/20",
               // `h-0 min-h-full`: fill the row without contributing to its
               // height, so a tall panel scrolls instead of stretching the canvas.
@@ -130,7 +153,7 @@ export function GraphCanvasShell({
         )}
       </div>
 
-      {footer && <div className="shrink-0 px-4 pb-3 pt-2 sm:px-6">{footer}</div>}
+      {footer && <div className={cn("shrink-0 pb-3 pt-2", pad)}>{footer}</div>}
     </div>
   );
 }
